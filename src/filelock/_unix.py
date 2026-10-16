@@ -86,10 +86,16 @@ else:  # pragma: win32 no cover
                 return None
             fd, created = opened
             self._mark_descriptor_pending(fd)
-            try:
-                if created:
-                    # Before the flock: a peer may win it first, and only the creator may set the mode.
+            if created:
+                # Before the flock: a peer may win it first, and only the creator may set the mode. Outside the flock
+                # handler below: an fchmod that answers ENOSYS says nothing about flock.
+                try:
                     self._apply_explicit_mode(fd)
+                except OSError:
+                    self._mark_descriptor_released()
+                    os.close(fd)
+                    raise
+            try:
                 locked = _lock_fd_nonblocking(fd)
             except OSError as exception:
                 if exception.errno != ENOSYS:
