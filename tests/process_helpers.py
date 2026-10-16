@@ -30,7 +30,7 @@ def cleanup_processes(processes: list[BaseProcess]) -> Generator[None]:
             process.close()
 
 
-def call_within(call: Callable[[], object], seconds: float) -> tuple[bool, BaseException | None]:
+def call_within(call: Callable[[], object], seconds: float) -> tuple[bool, BaseException | None]:  # pragma: win32 cover
     """Run *call* on a daemon thread and report whether it returned within *seconds* and what it raised."""
     raised: list[BaseException] = []
 
