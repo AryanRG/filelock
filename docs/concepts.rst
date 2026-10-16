@@ -430,7 +430,9 @@ How filelock mitigates this:
 The defense differs by platform:
 
 - On Unix, filelock opens lock files with ``O_NOFOLLOW``, so a symlink planted at the lock path makes the open fail
-  instead of reaching its target.
+  instead of reaching its target. ``O_NOFOLLOW`` does not see a hard link or a file renamed to the lock path, and
+  nothing tells such a file from a lock file, so :class:`UnixFileLock <filelock.UnixFileLock>` locks a file it did not
+  create as it finds it, without truncating it or changing its mode.
 - Windows has no ``O_NOFOLLOW``. :class:`WindowsFileLock <filelock.WindowsFileLock>` opens the file without following
   reparse points and rejects a symlink or junction by inspecting the handle it locks, so a swap between check and use
   cannot redirect it. Only the last path component is guarded; the lock directory must not be writable by untrusted
@@ -957,7 +959,8 @@ inheritance so the lock file gets the directory's default permissions rather tha
 
 When you pass an explicit ``mode`` value (e.g., ``mode=0o644``), filelock creates the file with it. On Unix,
 :class:`UnixFileLock <filelock.UnixFileLock>` and :class:`SoftFileLock <filelock.SoftFileLock>` then apply it with
-``fchmod``, so the umask cannot narrow it. This overrides any default ACLs on the directory.
+``fchmod``, so the umask cannot narrow it. This overrides any default ACLs on the directory. A lock file that already
+exists keeps the mode it has.
 
 An explicit ``mode`` must be an :class:`int` within ``0o000``-``0o777`` that grants the owner read and write;
 construction raises :class:`TypeError` for another type and :class:`ValueError` otherwise. A lock reopens, reads, and
