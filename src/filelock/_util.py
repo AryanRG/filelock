@@ -1,15 +1,18 @@
 from __future__ import annotations
 
-__lazy_modules__ = ["contextlib", "pathlib", "secrets", "typing"]
+__lazy_modules__ = ["contextlib", "pathlib", "secrets"]
 
 import os
 import secrets
 import stat
 import sys
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from errno import EACCES, EIO, EISDIR
 from pathlib import Path
-from typing import Final
+from typing import TYPE_CHECKING, Final
+
+if TYPE_CHECKING:
+    from contextlib import AbstractContextManager
 
 
 def write_all(fd: int, data: bytes) -> None:
@@ -119,7 +122,8 @@ def break_lock_file(lock_file: str, mtime_before: float, ino_before: int) -> Non
     if (current := os.lstat(lock_file)).st_mtime > mtime_before or current.st_ino != ino_before:
         return
     break_path: Final[str] = f"{lock_file}.break.{os.getpid()}.{secrets.token_hex(16)}"
-    Path(lock_file).rename(break_path)
+    with _pinned_for_rename(lock_file):
+        Path(lock_file).rename(break_path)
     if (st_after := os.lstat(break_path)).st_mtime <= mtime_before and st_after.st_ino == ino_before:
         unlink_path(break_path)
     elif stat.S_ISREG(st_after.st_mode) and _HAS_LINK:  # pragma: needs hard-link
@@ -130,13 +134,23 @@ def break_lock_file(lock_file: str, mtime_before: float, ino_before: int) -> Non
 
 if sys.platform == "win32":  # pragma: win32 cover
 
+    def _pinned_for_rename(path: str) -> AbstractContextManager[object]:
+        # A rename by path waits on a Level 1 or batch oplock holder until it answers or closes. Opening first with
+        # FILE_COMPLETE_IF_OPLOCKED turns that wait into BlockingIOError, and the open handle shares delete, so the
+        # rename then proceeds. Imported here because _windows imports this module.
+        from filelock._windows import open_for_delete_without_oplock_wait  # ruff:ignore[import-outside-top-level]
+
+        return os.fdopen(open_for_delete_without_oplock_wait(path), "rb")
+
     def unlink_path(path: str) -> None:
-        # Imported here because _windows imports this module.
         from filelock._windows import unlink_without_oplock_wait  # ruff:ignore[import-outside-top-level]
 
         unlink_without_oplock_wait(path)
 
 else:  # pragma: win32 no cover
+
+    def _pinned_for_rename(_path: str) -> AbstractContextManager[object]:
+        return nullcontext()
 
     def unlink_path(path: str) -> None:
         Path(path).unlink()

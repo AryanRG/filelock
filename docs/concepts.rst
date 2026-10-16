@@ -447,7 +447,9 @@ The defense differs by platform:
   users.
 - :class:`SoftFileLock <filelock.SoftFileLock>` creates its marker with ``O_CREAT | O_EXCL``, which fails on any
   existing name. Before reading a marker it classifies the path with ``lstat`` and treats anything other than a regular
-  file as malformed, then checks the opened handle again with ``fstat``.
+  file as malformed, then checks the opened handle again with ``fstat``. On Windows it reads and breaks markers through
+  handles that do not wait for an oplock holder to answer, so an oplock on a marker ends as contention and the
+  ``timeout`` holds.
 
 :class:`ReadWriteLock <filelock.ReadWriteLock>` refuses a symlink at its database path and keeps SQLite on the file it
 checked, so a link planted in a shared directory cannot point the lock at another file.

@@ -12,12 +12,15 @@ from typing import TYPE_CHECKING, Final
 import pytest
 from capabilities import CAPABILITIES
 
-from filelock import SoftFileLock, Timeout
+from filelock import SoftFileLock, Timeout, _util
 from filelock._identity import host_name
+from filelock._util import break_lock_file
 from tests.capability_marks import NEEDS_FILE_PERMISSIONS, NEEDS_SYMLINK, NEEDS_UNLINK_OPEN_FILE
+from tests.process_helpers import call_within
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator
+    from contextlib import AbstractContextManager
 
     from pytest_mock import MockerFixture
 
@@ -45,6 +48,18 @@ def test_break_lock_file_unlinks_a_dead_holders_marker(stale_lock: Path) -> None
         assert list(stale_lock.parent.glob("test.lock.break.*")) == []
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="oplocks exist only on Windows")
+def test_break_lock_file_skips_a_marker_under_an_oplock(  # pragma: win32 cover
+    stale_lock: Path, hold_oplock: Callable[[Path], Callable[[], None]]
+) -> None:
+    held = stale_lock.stat()
+    hold_oplock(stale_lock)
+
+    finished, error = call_within(lambda: break_lock_file(str(stale_lock), held.st_mtime, held.st_ino), 5)
+
+    assert (finished, type(error), stale_lock.exists()) == (True, BlockingIOError, True)
+
+
 def _rewrite_in_place(lock: Path) -> None:  # pragma: needs hard-link
     lock.write_text("live", encoding="utf-8")
     os.utime(lock, (time.time() + 10, time.time() + 10))
@@ -67,13 +82,13 @@ def _replace_with_same_mtime(lock: Path) -> None:  # pragma: needs hard-link
 def test_break_lock_file_restores_a_recreated_marker(  # pragma: needs hard-link
     stale_lock: Path, mocker: MockerFixture, recreate: Callable[[Path], None]
 ) -> None:
-    rename: Final = Path.rename
+    pin: Final = _util._pinned_for_rename
 
-    def peer_recreates_then_rename(source: Path, target: str) -> Path:
-        recreate(source)
-        return rename(source, target)
+    def peer_recreates_then_pin(path: str) -> AbstractContextManager[object]:
+        recreate(Path(path))  # Windows refuses an in-place rewrite once the pin holds the marker
+        return pin(path)
 
-    mocker.patch.object(Path, "rename", autospec=True, side_effect=peer_recreates_then_rename)
+    mocker.patch("filelock._util._pinned_for_rename", side_effect=peer_recreates_then_pin)
     with pytest.raises(Timeout):
         SoftFileLock(stale_lock).acquire(blocking=False)
 
@@ -110,14 +125,19 @@ def test_break_lock_file_keeps_a_third_marker_created_after_the_rename(  # pragm
     stale_lock: Path, mocker: MockerFixture
 ) -> None:
     rename: Final = Path.rename
+    pin: Final = _util._pinned_for_rename
 
-    def peer_recreates_then_third_creates(source: Path, target: str) -> Path:
-        _rewrite_in_place(source)
+    def peer_recreates_then_pin(path: str) -> AbstractContextManager[object]:
+        _rewrite_in_place(Path(path))  # Windows refuses an in-place rewrite once the pin holds the marker
+        return pin(path)
+
+    def rename_then_third_creates(source: Path, target: str) -> Path:
         result: Final[Path] = rename(source, target)
         source.write_text("third", encoding="utf-8")
         return result
 
-    mocker.patch.object(Path, "rename", autospec=True, side_effect=peer_recreates_then_third_creates)
+    mocker.patch("filelock._util._pinned_for_rename", side_effect=peer_recreates_then_pin)
+    mocker.patch.object(Path, "rename", autospec=True, side_effect=rename_then_third_creates)
     with pytest.raises(Timeout):
         SoftFileLock(stale_lock).acquire(blocking=False)
 
