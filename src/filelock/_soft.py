@@ -92,9 +92,9 @@ class SoftFileLock(BaseFileLock):
         self._publish_held_marker(fd)
 
     def _publish_held_marker(self, fd: int) -> None:
-        # Publish held state only once the record is fully on disk. On any failure, including cancellation, close the
-        # descriptor and unlink the path only while it still names the file we opened, so a rollback never deletes a
-        # successor's marker that replaced ours at the same path after our lease expired.
+        # Publish held state only once the record is fully on disk. On any failure, including cancellation, remove the
+        # path only while it still names the file we opened, so a rollback never deletes a successor's marker that
+        # replaced ours after a contender evicted it.
         identity: tuple[int, int] | None = None
         try:
             identity = _file_identity(os.fstat(fd))
@@ -103,9 +103,18 @@ class SoftFileLock(BaseFileLock):
         except BaseException:
             self._mark_descriptor_released()
             try:
-                os.close(fd)
+                if sys.platform != "win32":  # pragma: win32 no cover
+                    # Before the close: our open descriptor keeps the inode allocated, so a successor's marker cannot
+                    # carry its number, and a break renames rather than unlinks whatever the path names by then.
+                    with suppress(OSError):
+                        written: Final = os.fstat(fd)
+                        break_lock_file(self.lock_file, written.st_mtime, written.st_ino)
             finally:
-                self._unlink_held_marker(identity)
+                try:
+                    os.close(fd)
+                finally:
+                    if sys.platform == "win32":  # pragma: win32 cover
+                        self._unlink_held_marker(identity)
             raise
         self._mark_descriptor_owned(fd, identity)
 
@@ -287,10 +296,9 @@ class SoftFileLock(BaseFileLock):
                 raise
 
     def _unlink_held_marker(self, identity: tuple[int, int] | None) -> None:
-        if identity is None:
-            return
         if sys.platform == "win32":  # pragma: win32 cover
-            self._windows_unlink_if_ours(identity)
+            if identity is not None:
+                self._windows_unlink_if_ours(identity)
         else:  # pragma: win32 no cover
             with suppress(OSError):
                 if _file_identity(os.lstat(self.lock_file)) == identity:
