@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import threading
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Final
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
+    from collections.abc import Callable, Generator
     from multiprocessing.process import BaseProcess
 
 #: Stays under the suite's per-test timeout so a wedged worker still surfaces as the hang it is.
@@ -29,4 +30,20 @@ def cleanup_processes(processes: list[BaseProcess]) -> Generator[None]:
             process.close()
 
 
-__all__ = ["cleanup_processes"]
+def call_within(call: Callable[[], object], seconds: float) -> tuple[bool, BaseException | None]:
+    """Run *call* on a daemon thread and report whether it returned within *seconds* and what it raised."""
+    raised: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            call()
+        except Exception as error:  # handed to the caller, which asserts on it
+            raised.append(error)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(seconds)
+    return not thread.is_alive(), next(iter(raised), None)
+
+
+__all__ = ["call_within", "cleanup_processes"]

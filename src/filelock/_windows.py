@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-__lazy_modules__ = ["contextlib", "filelock._util", "msvcrt", "pathlib", "typing"]
+__lazy_modules__ = ["contextlib", "filelock._util", "msvcrt", "typing"]
 
 import os
 import sys
 import time
 from contextlib import suppress
-from errno import EWOULDBLOCK
+from errno import ENOENT, EWOULDBLOCK
 from functools import cache
-from pathlib import Path
 from typing import Final, cast
 
 from filelock._api import BaseFileLock
@@ -22,6 +21,7 @@ if sys.platform == "win32":  # pragma: win32 cover
     _GENERIC_READ: Final[int] = 0x80000000
     _GENERIC_WRITE: Final[int] = 0x40000000
     _SYNCHRONIZE: Final[int] = 0x00100000
+    _DELETE: Final[int] = 0x00010000
     _DESIRED_ACCESS: Final[int] = _GENERIC_READ | _GENERIC_WRITE | _SYNCHRONIZE
     _FILE_SHARE_READ_WRITE: Final[int] = (
         0x00000001 | 0x00000002
@@ -39,6 +39,7 @@ if sys.platform == "win32":  # pragma: win32 cover
     # reparse point rather than following it so the check below acts on the link itself.
     _FILE_SYNCHRONOUS_IO_NONALERT: Final[int] = 0x00000020
     _FILE_NON_DIRECTORY_FILE: Final[int] = 0x00000040
+    _FILE_DELETE_ON_CLOSE: Final[int] = 0x00001000
     _FILE_COMPLETE_IF_OPLOCKED: Final[int] = 0x00000100
     _FILE_OPEN_REPARSE_POINT: Final[int] = 0x00200000
     _CREATE_OPTIONS: Final[int] = (
@@ -64,6 +65,7 @@ if sys.platform == "win32":  # pragma: win32 cover
     _STATUS_OPLOCK_BREAK_IN_PROGRESS: Final[int] = 0x00000108
     _STATUS_ACCESS_DENIED: Final[int] = 0xC0000022
     _STATUS_OBJECT_NAME_NOT_FOUND: Final[int] = 0xC0000034
+    _STATUS_OBJECT_PATH_NOT_FOUND: Final[int] = 0xC000003A
     _STATUS_SHARING_VIOLATION: Final[int] = 0xC0000043
     _STATUS_DELETE_PENDING: Final[int] = 0xC0000056
     #: How long an open waits out a STATUS_ACCESS_DENIED before treating it as a real denial: NTFS answers it for a
@@ -240,7 +242,7 @@ if sys.platform == "win32":  # pragma: win32 cover
             self._close_released_fd(fd, default_suppresses=False)
             if not self._preserve_lock_file:  # preserve_lock_file keeps a stable file identity for the caller (#605)
                 with suppress(OSError):
-                    Path(self.lock_file).unlink()
+                    unlink_without_oplock_wait(self.lock_file)
 
     def _open_non_reparse_fd(path: str, mode: int, *, oplock_wait: float = _ACCESS_DENIED_GRACE) -> int | None:
         """
@@ -296,9 +298,44 @@ if sys.platform == "win32":  # pragma: win32 cover
         if status != _STATUS_SUCCESS:
             if status in {_STATUS_SHARING_VIOLATION, _STATUS_DELETE_PENDING}:
                 return None
-            winerror = _ntdll.RtlNtStatusToDosError(status)
-            raise OSError(None, ctypes.FormatError(winerror).strip(), path, winerror)
+            raise _status_error(status, path)
 
+        return _descriptor_for_non_reparse(handle, path, os.O_RDWR)
+
+    def unlink_without_oplock_wait(path: str) -> None:
+        """
+        Delete *path* through a handle that does not wait for an oplock holder to answer its break.
+
+        ``os.unlink`` waits like ``os.open`` does. Here an unanswered break leaves the file in place, which callers
+        accept since deleting a lock file is best effort. A symlink at *path* is deleted as a link.
+
+        :param path: the file to delete.
+
+        :raises FileNotFoundError: if *path* does not exist.
+        :raises OSError: if the open fails for any other reason, such as a sharing violation.
+
+        """
+        sys.audit("os.remove", path, None)
+        handle, status = _nt_create(
+            path,
+            _DELETE | _SYNCHRONIZE,
+            _FILE_ATTRIBUTE_NORMAL,
+            _FILE_SHARE_ALL,
+            _FILE_OPEN,
+            options=_CREATE_OPTIONS | _FILE_DELETE_ON_CLOSE,
+        )
+        if status == _STATUS_SUCCESS:
+            _kernel32.CloseHandle(handle)  # deletes the file
+        elif status != _STATUS_OPLOCK_BREAK_IN_PROGRESS:
+            raise _status_error(status, path)
+
+    def _status_error(status: int, path: str) -> OSError:
+        if status in {_STATUS_OBJECT_NAME_NOT_FOUND, _STATUS_OBJECT_PATH_NOT_FOUND}:
+            return FileNotFoundError(ENOENT, os.strerror(ENOENT), path)
+        winerror = _ntdll.RtlNtStatusToDosError(status)
+        return OSError(None, ctypes.FormatError(winerror).strip(), path, winerror)
+
+    def _descriptor_for_non_reparse(handle: int, path: str, flags: int) -> int:
         info = _BY_HANDLE_FILE_INFORMATION()
         # Querying an open handle we just created does not fail.
         if not _kernel32.GetFileInformationByHandle(handle, ctypes.byref(info)):  # pragma: no cover
@@ -312,7 +349,7 @@ if sys.platform == "win32":  # pragma: win32 cover
 
         try:
             # O_NOINHERIT mirrors os.open on Windows: the lock fd must not leak into child processes.
-            return msvcrt.open_osfhandle(handle, os.O_RDWR | os.O_NOINHERIT)
+            return msvcrt.open_osfhandle(handle, flags | os.O_NOINHERIT)
         except BaseException:  # pragma: no cover  # open_osfhandle audits too; a hook raising must not leak the handle
             _kernel32.CloseHandle(handle)
             raise
@@ -362,6 +399,7 @@ if sys.platform == "win32":  # pragma: win32 cover
         disposition: int,
         *,
         descriptor: ctypes.c_void_p | None = None,
+        options: int = _CREATE_OPTIONS,
     ) -> tuple[int, int]:
         """
         Open *path* through ``NtCreateFile`` and return ``(handle, status)``.
@@ -394,7 +432,7 @@ if sys.platform == "win32":  # pragma: win32 cover
                     attributes,
                     share,
                     disposition,
-                    _CREATE_OPTIONS,
+                    options,
                     None,
                     0,
                 )
@@ -424,4 +462,5 @@ __all__ = [
     "WindowsFileLock",
     "_is_unlinked",
     "_open_non_reparse_fd",
+    "unlink_without_oplock_wait",
 ]

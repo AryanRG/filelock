@@ -121,11 +121,25 @@ def break_lock_file(lock_file: str, mtime_before: float, ino_before: int) -> Non
     break_path: Final[str] = f"{lock_file}.break.{os.getpid()}.{secrets.token_hex(16)}"
     Path(lock_file).rename(break_path)
     if (st_after := os.lstat(break_path)).st_mtime <= mtime_before and st_after.st_ino == ino_before:
-        Path(break_path).unlink()
+        unlink_path(break_path)
     elif stat.S_ISREG(st_after.st_mode) and _HAS_LINK:  # pragma: needs hard-link
         with suppress(FileExistsError):
             os.link(break_path, lock_file)
-            Path(break_path).unlink()
+            unlink_path(break_path)
+
+
+if sys.platform == "win32":  # pragma: win32 cover
+
+    def unlink_path(path: str) -> None:
+        # Imported here because _windows imports this module.
+        from filelock._windows import unlink_without_oplock_wait  # ruff:ignore[import-outside-top-level]
+
+        unlink_without_oplock_wait(path)
+
+else:  # pragma: win32 no cover
+
+    def unlink_path(path: str) -> None:
+        Path(path).unlink()
 
 
 def touch(name: str, *, fd: int) -> None:
@@ -153,5 +167,6 @@ __all__ = [
     "ensure_directory_exists",
     "raise_on_not_writable_file",
     "touch",
+    "unlink_path",
     "write_all",
 ]

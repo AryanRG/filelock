@@ -23,7 +23,13 @@ from typing import Final
 from filelock._api import BaseFileLock, _raise_grouped_errors
 from filelock._identity import host_name, owner_is_current_process, owner_is_stale, process_start_token
 from filelock._soft_protocol import STRICT_SOFT_SENTINEL_RECORD
-from filelock._util import break_lock_file, ensure_directory_exists, raise_on_not_writable_file, write_all
+from filelock._util import (
+    break_lock_file,
+    ensure_directory_exists,
+    raise_on_not_writable_file,
+    unlink_path,
+    write_all,
+)
 
 MALFORMED_LOCK_AGE_THRESHOLD: Final[float] = 2.0
 _MAX_LOCK_FILE_SIZE: Final[int] = 1024
@@ -300,7 +306,7 @@ class SoftFileLock(BaseFileLock):
                     # Forgotten before the unlink: Windows does not promise unique file IDs, so no retry may reach a
                     # successor that reused ours.
                     self._marker_cleanup = None
-                    os.unlink(path)  # ruff:ignore[os-unlink]  # Path.unlink runs Python code a handler can interrupt
+                    unlink_path(path)
             except OSError as exc:
                 if exc.errno in {EACCES, EPERM}:
                     # The file is still ours, so the next acquire or release tries again if these attempts run out.
