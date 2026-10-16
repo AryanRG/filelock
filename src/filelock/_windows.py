@@ -33,11 +33,15 @@ if sys.platform == "win32":  # pragma: win32 cover
     _FILE_ATTRIBUTE_NORMAL: Final[int] = 0x00000080
     _FILE_ATTRIBUTE_REPARSE_POINT: Final[int] = 0x00000400
     # CreateOptions: keep the handle synchronous (the CRT and msvcrt.locking rely on a maintained file position),
-    # refuse a directory, and open a reparse point rather than following it so the check below acts on the link itself.
+    # refuse a directory, return at once rather than wait for another handle's oplock holder to answer the break, and
+    # open a reparse point rather than following it so the check below acts on the link itself.
     _FILE_SYNCHRONOUS_IO_NONALERT: Final[int] = 0x00000020
     _FILE_NON_DIRECTORY_FILE: Final[int] = 0x00000040
+    _FILE_COMPLETE_IF_OPLOCKED: Final[int] = 0x00000100
     _FILE_OPEN_REPARSE_POINT: Final[int] = 0x00200000
-    _CREATE_OPTIONS: Final[int] = _FILE_SYNCHRONOUS_IO_NONALERT | _FILE_NON_DIRECTORY_FILE | _FILE_OPEN_REPARSE_POINT
+    _CREATE_OPTIONS: Final[int] = (
+        _FILE_SYNCHRONOUS_IO_NONALERT | _FILE_NON_DIRECTORY_FILE | _FILE_COMPLETE_IF_OPLOCKED | _FILE_OPEN_REPARSE_POINT
+    )
     _OBJ_CASE_INSENSITIVE: Final[int] = 0x00000040  # Win32 name lookups are case-insensitive
     _OWNER_WRITE: Final[int] = 0o200
 
@@ -54,12 +58,15 @@ if sys.platform == "win32":  # pragma: win32 cover
     # ERROR_ACCESS_DENIED. Telling them apart is the point (#604): a name pending deletion or a share conflict is
     # transient and worth a retry, a real access denial is not.
     _STATUS_SUCCESS: Final[int] = 0x00000000
+    # A success code that comes with a handle: another handle's oplock is being broken and its holder has not answered.
+    _STATUS_OPLOCK_BREAK_IN_PROGRESS: Final[int] = 0x00000108
     _STATUS_ACCESS_DENIED: Final[int] = 0xC0000022
     _STATUS_OBJECT_NAME_NOT_FOUND: Final[int] = 0xC0000034
     _STATUS_SHARING_VIOLATION: Final[int] = 0xC0000043
     _STATUS_DELETE_PENDING: Final[int] = 0xC0000056
     #: How long an open waits out a STATUS_ACCESS_DENIED before treating it as a real denial: NTFS answers it for a
-    #: moment while a peer's unlink tears the name down, so a bounded wait keeps a real denial failing fast (#604).
+    #: moment while a peer's unlink tears the name down, so a bounded wait keeps a real denial failing fast (#604). An
+    #: oplock break gets the same wait, long enough for a holder that answers it, such as an indexer.
     _ACCESS_DENIED_GRACE: Final[float] = 0.5
     _ACCESS_DENIED_RETRY: Final[float] = 0.002
 
@@ -246,8 +253,8 @@ if sys.platform == "win32":  # pragma: win32 cover
         :param mode: the permission mode; as ``os.open`` does on Windows, a cleared owner-write bit creates the file
             read-only. The attribute only takes effect when the file is created, not when an existing one is opened.
 
-        :returns: a file descriptor owning the opened handle, or ``None`` on a sharing violation or a delete-pending
-            name the caller should treat as contention and retry.
+        :returns: a file descriptor owning the opened handle, or ``None`` on a sharing violation, a delete-pending name,
+            or an oplock break its holder leaves unanswered, which the caller should treat as contention and retry.
 
         :raises OSError: if the path resolves to a reparse point, or the open fails for any other reason, raised with
             the Win32 error the status maps to. An access denial is raised only once it outlasts a short grace, since
@@ -258,13 +265,13 @@ if sys.platform == "win32":  # pragma: win32 cover
         sys.audit("open", path, None, os.O_RDWR | os.O_CREAT)
         read_only = not mode & _OWNER_WRITE
         handle, status = _nt_open(path, read_only=read_only)
-        if status == _STATUS_ACCESS_DENIED:
+        if status in {_STATUS_ACCESS_DENIED, _STATUS_OPLOCK_BREAK_IN_PROGRESS}:
             deadline = time.monotonic() + _ACCESS_DENIED_GRACE
-            while status == _STATUS_ACCESS_DENIED and time.monotonic() < deadline:
+            while status in {_STATUS_ACCESS_DENIED, _STATUS_OPLOCK_BREAK_IN_PROGRESS} and time.monotonic() < deadline:
                 time.sleep(_ACCESS_DENIED_RETRY)
                 handle, status = _nt_open(path, read_only=read_only)
         if status != _STATUS_SUCCESS:
-            if status in {_STATUS_SHARING_VIOLATION, _STATUS_DELETE_PENDING}:
+            if status in {_STATUS_SHARING_VIOLATION, _STATUS_DELETE_PENDING, _STATUS_OPLOCK_BREAK_IN_PROGRESS}:
                 return None
             winerror = _ntdll.RtlNtStatusToDosError(status)
             raise OSError(None, ctypes.FormatError(winerror).strip(), path, winerror)
@@ -311,7 +318,9 @@ if sys.platform == "win32":  # pragma: win32 cover
 
         ``RtlDosPathNameToNtPathName_U_WithStatus`` translates the Win32 path to the NT namespace, handling relative,
         drive, UNC and extended-length path forms as Win32 itself would, and allocates a buffer that
-        ``RtlFreeUnicodeString`` releases. The handle is ``0`` unless the status is ``STATUS_SUCCESS``.
+        ``RtlFreeUnicodeString`` releases. The handle is ``0`` unless the status is ``STATUS_SUCCESS``: one that comes
+        with ``STATUS_OPLOCK_BREAK_IN_PROGRESS`` is closed here, since the file is not ours until the oplock holder
+        answers.
         """
         nt_name = _UNICODE_STRING()
         status = _ntdll.RtlDosPathNameToNtPathName_U_WithStatus(path, ctypes.byref(nt_name), None, None) & 0xFFFFFFFF
@@ -342,6 +351,8 @@ if sys.platform == "win32":  # pragma: win32 cover
             )
         finally:
             _ntdll.RtlFreeUnicodeString(ctypes.byref(nt_name))
+        if status == _STATUS_OPLOCK_BREAK_IN_PROGRESS:
+            _kernel32.CloseHandle(handle)
         if status != _STATUS_SUCCESS:
             return 0, status
         return handle.value or 0, status
